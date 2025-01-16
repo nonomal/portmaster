@@ -5,28 +5,33 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
-	"github.com/safing/portbase/dataroot"
-	"github.com/safing/portbase/info"
-	portlog "github.com/safing/portbase/log"
-	"github.com/safing/portbase/updater"
-	"github.com/safing/portbase/utils"
-	"github.com/safing/portmaster/updates/helper"
+	"github.com/safing/portmaster/base/dataroot"
+	"github.com/safing/portmaster/base/info"
+	portlog "github.com/safing/portmaster/base/log"
+	"github.com/safing/portmaster/base/updater"
+	"github.com/safing/portmaster/base/utils"
+	"github.com/safing/portmaster/service/updates/helper"
 )
 
 var (
 	dataDir    string
-	staging    bool
 	maxRetries int
 	dataRoot   *utils.DirStructure
 	logsRoot   *utils.DirStructure
+	forceOldUI bool
+
+	updateURLFlag string
+	userAgentFlag string
 
 	// Create registry.
 	registry = &updater.ResourceRegistry{
@@ -34,8 +39,10 @@ var (
 		UpdateURLs: []string{
 			"https://updates.safing.io",
 		},
-		DevMode: false,
-		Online:  true, // is disabled later based on command
+		UserAgent:    fmt.Sprintf("Portmaster Start (%s %s)", runtime.GOOS, runtime.GOARCH),
+		Verification: helper.VerificationConfig,
+		DevMode:      false,
+		Online:       true, // is disabled later based on command
 	}
 
 	rootCmd = &cobra.Command{
@@ -64,10 +71,11 @@ func init() {
 	flags := rootCmd.PersistentFlags()
 	{
 		flags.StringVar(&dataDir, "data", "", "Configures the data directory. Alternatively, this can also be set via the environment variable PORTMASTER_DATA.")
-		flags.StringVar(&registry.UserAgent, "update-agent", "Start", "Sets the user agent for requests to the update server")
-		flags.BoolVar(&staging, "staging", false, "Deprecated, configure in settings instead.")
+		flags.StringVar(&updateURLFlag, "update-server", "", "Set an alternative update server (full URL)")
+		flags.StringVar(&userAgentFlag, "update-agent", "", "Set an alternative user agent for requests to the update server")
 		flags.IntVar(&maxRetries, "max-retries", 5, "Maximum number of retries when starting a Portmaster component")
 		flags.BoolVar(&stdinSignals, "input-signals", false, "Emulate signals using stdin.")
+		flags.BoolVar(&forceOldUI, "old-ui", false, "Use the old ui. (Beta)")
 		_ = rootCmd.MarkPersistentFlagDirname("data")
 		_ = flags.MarkHidden("input-signals")
 	}
@@ -77,7 +85,7 @@ func main() {
 	cobra.OnInitialize(initCobra)
 
 	// set meta info
-	info.Set("Portmaster Start", "0.8.8", "AGPLv3", false)
+	info.Set("Portmaster Start", "", "GPLv3")
 
 	// catch interrupt for clean shutdown
 	signalCh := make(chan os.Signal, 2)
@@ -126,7 +134,7 @@ func initCobra() {
 
 	// set up logging
 	log.SetFlags(log.Ldate | log.Ltime | log.LUTC)
-	log.SetPrefix("[control] ")
+	log.SetPrefix("[pmstart] ")
 	log.SetOutput(os.Stdout)
 
 	// not using portbase logger
@@ -134,6 +142,25 @@ func initCobra() {
 }
 
 func configureRegistry(mustLoadIndex bool) error {
+	// Check if update server URL supplied via flag is a valid URL.
+	if updateURLFlag != "" {
+		u, err := url.Parse(updateURLFlag)
+		if err != nil {
+			return fmt.Errorf("supplied update server URL is invalid: %w", err)
+		}
+		if u.Scheme != "https" {
+			return errors.New("supplied update server URL must use HTTPS")
+		}
+	}
+
+	// Override values from flags.
+	if userAgentFlag != "" {
+		registry.UserAgent = userAgentFlag
+	}
+	if updateURLFlag != "" {
+		registry.UpdateURLs = []string{updateURLFlag}
+	}
+
 	// If dataDir is not set, check the environment variable.
 	if dataDir == "" {
 		dataDir = os.Getenv("PORTMASTER_DATA")
@@ -152,14 +179,14 @@ func configureRegistry(mustLoadIndex bool) error {
 	// Remove left over quotes.
 	dataDir = strings.Trim(dataDir, `\"`)
 	// Initialize data root.
-	err := dataroot.Initialize(dataDir, 0o0755)
+	err := dataroot.Initialize(dataDir, utils.PublicReadPermission)
 	if err != nil {
 		return fmt.Errorf("failed to initialize data root: %w", err)
 	}
 	dataRoot = dataroot.Root()
 
 	// Initialize registry.
-	err = registry.Initialize(dataRoot.ChildDir("updates", 0o0755))
+	err = registry.Initialize(dataRoot.ChildDir("updates", utils.PublicReadPermission))
 	if err != nil {
 		return err
 	}
@@ -169,7 +196,7 @@ func configureRegistry(mustLoadIndex bool) error {
 
 func ensureLoggingDir() error {
 	// set up logs root
-	logsRoot = dataRoot.ChildDir("logs", 0o0777)
+	logsRoot = dataRoot.ChildDir("logs", utils.PublicWritePermission)
 	err := logsRoot.Ensure()
 	if err != nil {
 		return fmt.Errorf("failed to initialize logs root (%q): %w", logsRoot.Path, err)
@@ -185,7 +212,7 @@ func ensureLoggingDir() error {
 
 func updateRegistryIndex(mustLoadIndex bool) error {
 	// Set indexes based on the release channel.
-	warning := helper.SetIndexes(registry, "", false)
+	warning := helper.SetIndexes(registry, "", false, false, false)
 	if warning != nil {
 		log.Printf("WARNING: %s\n", warning)
 	}

@@ -16,13 +16,22 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/tevino/abool"
 
-	"github.com/safing/portmaster/updates/helper"
+	"github.com/safing/portmaster/service/updates/helper"
 )
 
 const (
 	// RestartExitCode is the exit code that any service started by portmaster-start
 	// can return in order to trigger a restart after a clean shutdown.
 	RestartExitCode = 23
+
+	// ControlledFailureExitCode is the exit code that any service started by
+	// portmaster-start can return in order to signify a controlled failure.
+	// This disables retrying and exits with an error code.
+	ControlledFailureExitCode = 24
+
+	// StartOldUIExitCode is an exit code that is returned by the UI when there. This is manfully triaged by the user, if the new UI does not work for them.
+	StartOldUIExitCode        = 77
+	MissingDependencyExitCode = 0xc0000135 // Windows STATUS_DLL_NOT_FOUND
 
 	exeSuffix = ".exe"
 	zipSuffix = ".zip"
@@ -33,6 +42,8 @@ var (
 	onWindows        = runtime.GOOS == "windows"
 	stdinSignals     bool
 	childIsRunning   = abool.NewBool(false)
+
+	fallBackToOldUI bool = false
 )
 
 // Options for starting component.
@@ -41,14 +52,30 @@ type Options struct {
 	Identifier        string // component identifier
 	ShortIdentifier   string // populated automatically
 	LockPathPrefix    string
+	LockPerUser       bool
 	PIDFile           bool
 	SuppressArgs      bool // do not use any args
 	AllowDownload     bool // allow download of component if it is not yet available
 	AllowHidingWindow bool // allow hiding the window of the subprocess
 	NoOutput          bool // do not use stdout/err if logging to file is available (did not fail to open log file)
+	RestartOnFail     bool // Try restarting automatically, if the started component fails.
+}
+
+// This is a temp value that will be used to test the new UI in beta.
+var app2Options = Options{
+	Name:              "Portmaster App2",
+	Identifier:        "app2/portmaster-app",
+	AllowDownload:     false,
+	AllowHidingWindow: false,
+	RestartOnFail:     true,
 }
 
 func init() {
+	// Make sure the new UI has a proper extension.
+	if onWindows {
+		app2Options.Identifier += ".zip"
+	}
+
 	registerComponent([]Options{
 		{
 			Name:              "Portmaster Core",
@@ -56,16 +83,19 @@ func init() {
 			AllowDownload:     true,
 			AllowHidingWindow: true,
 			PIDFile:           true,
+			RestartOnFail:     true,
 		},
 		{
 			Name:              "Portmaster App",
 			Identifier:        "app/portmaster-app.zip",
 			AllowDownload:     false,
 			AllowHidingWindow: false,
+			RestartOnFail:     true,
 		},
 		{
 			Name:              "Portmaster Notifier",
 			Identifier:        "notifier/portmaster-notifier",
+			LockPerUser:       true,
 			AllowDownload:     false,
 			AllowHidingWindow: true,
 			PIDFile:           true,
@@ -77,7 +107,9 @@ func init() {
 			AllowDownload:     true,
 			AllowHidingWindow: true,
 			PIDFile:           true,
+			RestartOnFail:     true,
 		},
+		app2Options,
 	})
 }
 
@@ -121,6 +153,21 @@ func getExecArgs(opts *Options, cmdArgs []string) []string {
 	if stdinSignals {
 		args = append(args, "--input-signals")
 	}
+
+	if runtime.GOOS == "linux" && opts.ShortIdentifier == "app" {
+		// see https://www.freedesktop.org/software/systemd/man/pam_systemd.html#type=
+		if xdgSessionType := os.Getenv("XDG_SESSION_TYPE"); xdgSessionType == "wayland" {
+			// we're running the Portmaster UI App under Wayland so make sure we add some arguments
+			// required by Electron.
+			args = append(args,
+				[]string{
+					"--enable-features=UseOzonePlatform,WaylandWindowDecorations",
+					"--ozone-platform=wayland",
+				}...,
+			)
+		}
+	}
+
 	args = append(args, cmdArgs...)
 	return args
 }
@@ -133,13 +180,9 @@ func run(opts *Options, cmdArgs []string) (err error) {
 		return nil
 	}
 
-	// get original arguments
-	// additional parameters can be specified using -- --some-parameter
-	args := getExecArgs(opts, cmdArgs)
-
 	// check for duplicate instances
 	if opts.PIDFile {
-		pid, err := checkAndCreateInstanceLock(opts.LockPathPrefix, opts.ShortIdentifier)
+		pid, err := checkAndCreateInstanceLock(opts.LockPathPrefix, opts.ShortIdentifier, opts.LockPerUser)
 		if err != nil {
 			return fmt.Errorf("failed to exec lock: %w", err)
 		}
@@ -147,7 +190,7 @@ func run(opts *Options, cmdArgs []string) (err error) {
 			return fmt.Errorf("another instance of %s is already running: PID %d", opts.Name, pid)
 		}
 		defer func() {
-			err := deleteInstanceLock(opts.LockPathPrefix, opts.ShortIdentifier)
+			err := deleteInstanceLock(opts.LockPathPrefix, opts.ShortIdentifier, opts.LockPerUser)
 			if err != nil {
 				log.Printf("failed to delete instance lock: %s\n", err)
 			}
@@ -179,7 +222,7 @@ func run(opts *Options, cmdArgs []string) (err error) {
 		}
 	}
 
-	return runAndRestart(opts, args)
+	return runAndRestart(opts, cmdArgs)
 }
 
 func runAndRestart(opts *Options, args []string) error {
@@ -198,7 +241,7 @@ func runAndRestart(opts *Options, args []string) error {
 			log.Printf("%s exited without error", opts.Identifier)
 		}
 
-		if !tryAgain {
+		if !opts.RestartOnFail || !tryAgain {
 			return err
 		}
 
@@ -229,7 +272,7 @@ func fixExecPerm(path string) error {
 		return nil
 	}
 
-	if err := os.Chmod(path, 0o0755); err != nil { //nolint:gosec // Set execution rights.
+	if err := os.Chmod(path, 0o0755); err != nil { //nolint:gosec
 		return fmt.Errorf("failed to chmod %s: %w", path, err)
 	}
 
@@ -286,6 +329,19 @@ func persistOutputStreams(opts *Options, version string, cmd *exec.Cmd) (chan st
 }
 
 func execute(opts *Options, args []string) (cont bool, err error) {
+	// Auto-upgrade to new UI if in beta and new UI is not disabled or failed.
+	if opts.ShortIdentifier == "app" &&
+		registry.UsePreReleases &&
+		!forceOldUI &&
+		!fallBackToOldUI {
+		log.Println("auto-upgraded to new UI")
+		opts = &app2Options
+	}
+
+	// Compile arguments and add additional arguments based on system configuration.
+	// Extra parameters can be specified using "-- --some-parameter".
+	args = getExecArgs(opts, args)
+
 	file, err := registry.GetFile(
 		helper.PlatformIdentifier(opts.Identifier),
 	)
@@ -413,6 +469,14 @@ func parseExitError(err error) (restart bool, errWithCtx error) {
 			return true, fmt.Errorf("error during execution: %w", err)
 		case RestartExitCode:
 			return true, nil
+		case ControlledFailureExitCode:
+			return false, errors.New("controlled failure, check logs")
+		case StartOldUIExitCode:
+			fallBackToOldUI = true
+			return true, errors.New("user requested old UI")
+		case MissingDependencyExitCode:
+			fallBackToOldUI = true
+			return true, errors.New("new UI failed with missing dependency")
 		default:
 			return true, fmt.Errorf("unknown exit code %w", exErr)
 		}
