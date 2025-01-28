@@ -1,10 +1,6 @@
 # Compiled binaries
-portmaster
-portmaster.exe
-dnsonly
-dnsonly.exe
-main
-main.exe
+*.exe
+dist/
 
 # Dist dir
 dist
@@ -16,10 +12,9 @@ go.mod.*
 vendor
 
 # testing
-testing
+testdata
 
 # Compiled Object files, Static and Dynamic libs (Shared Objects)
-*.o
 *.a
 *.so
 
@@ -51,3 +46,9 @@ _testmain.go
 
 # Custom dev scripts
 win_dev_*
+go.work
+go.work.sum
+
+# Kext releases
+windows_kext/release/kext_release_*.zip
+windows_core_dll/.vs/windows_core_dll
